@@ -7,8 +7,9 @@
 
 #include <rbd/librbd.h>
 
-#include "../fio.h"
-#include "../optgroup.h"
+#include "io_ddir.h"
+#include "io_u_queue.h"
+#include "rbd.h"
 
 struct fio_rbd_iou {
 	struct io_u *io_u;
@@ -31,49 +32,6 @@ struct rbd_options {
 	char *pool_name;
 	char *client_name;
 	int busy_poll;
-};
-
-static struct fio_option options[] = {
-	{
-		.name		= "rbdname",
-		.lname		= "rbd engine rbdname",
-		.type		= FIO_OPT_STR_STORE,
-		.help		= "RBD name for RBD engine",
-		.off1		= offsetof(struct rbd_options, rbd_name),
-		.category	= FIO_OPT_C_ENGINE,
-		.group		= FIO_OPT_G_RBD,
-	},
-	{
-		.name		= "pool",
-		.lname		= "rbd engine pool",
-		.type		= FIO_OPT_STR_STORE,
-		.help		= "Name of the pool hosting the RBD for the RBD engine",
-		.off1		= offsetof(struct rbd_options, pool_name),
-		.category	= FIO_OPT_C_ENGINE,
-		.group		= FIO_OPT_G_RBD,
-	},
-	{
-		.name		= "clientname",
-		.lname		= "rbd engine clientname",
-		.type		= FIO_OPT_STR_STORE,
-		.help		= "Name of the ceph client to access the RBD for the RBD engine",
-		.off1		= offsetof(struct rbd_options, client_name),
-		.category	= FIO_OPT_C_ENGINE,
-		.group		= FIO_OPT_G_RBD,
-	},
-	{
-		.name		= "busy_poll",
-		.lname		= "Busy poll",
-		.type		= FIO_OPT_BOOL,
-		.help		= "Busy poll for completions instead of sleeping",
-		.off1		= offsetof(struct rbd_options, busy_poll),
-		.def		= "0",
-		.category	= FIO_OPT_C_ENGINE,
-		.group		= FIO_OPT_G_RBD,
-	},
-	{
-		.name = NULL,
-	},
 };
 
 static int _fio_setup_rbd_data(struct thread_data *td,

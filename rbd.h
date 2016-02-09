@@ -8,6 +8,32 @@
 #ifndef RBD_H_
 #define RBD_H_
 
+/* - arch-x86.h */
+
+#define nop		__asm__ __volatile__("rep;nop": : :"memory")
+
+/* - ioengine.h */
+
+enum {
+	IO_U_F_FREE		= 1 << 0,
+	IO_U_F_FLIGHT		= 1 << 1,
+	IO_U_F_NO_FILE_PUT	= 1 << 2,
+	IO_U_F_IN_CUR_DEPTH	= 1 << 3,
+	IO_U_F_BUSY_OK		= 1 << 4,
+	IO_U_F_TRIMMED		= 1 << 5,
+	IO_U_F_BARRIER		= 1 << 6,
+	IO_U_F_VER_LIST		= 1 << 7,
+};
+
+/*
+ * io_ops->queue() return values
+ */
+enum {
+	FIO_Q_COMPLETED	= 0,		/* completed sync */
+	FIO_Q_QUEUED	= 1,		/* queued, will complete async */
+	FIO_Q_BUSY	= 2,		/* no more room, call ->commit() */
+};
+
 /*
  * The io unit
  */
@@ -105,6 +131,8 @@ struct io_u {
 		uint64_t null;
 	};
 };
+
+/* - fio.h */
 
 /*
  * This describes a single thread/process executing a fio job.
