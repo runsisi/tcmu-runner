@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
@@ -59,6 +60,8 @@ struct rbd_dev_state {
 };
 
 static int set_medium_error(uint8_t *sense);
+static struct io *rbd_get_io(struct rbd_io_handler *h);
+static void rbd_put_io(struct rbd_io_handler *h, struct io *io);
 static void rbd_io_callback(rbd_completion_t comp, void *data);
 static int rbd_prepare_io(struct rbd_dev_state *state, struct tcmulib_cmd *cmd, struct io *io);
 static int rbd_queue_io(struct rbd_dev_state *state, struct io *io);
@@ -82,6 +85,25 @@ static int set_medium_error(uint8_t *sense)
 	return tcmu_set_sense_data(sense, MEDIUM_ERROR, ASC_READ_ERROR, NULL);
 }
 
+static struct io *rbd_get_io(struct rbd_io_handler *h)
+{
+	struct io *io;
+
+	pthread_mutex_lock(&h->io_mtx);
+	io = h->ios[--h->io_nr];
+	h->ios[h->io_nr] = NULL;
+	pthread_mutex_unlock(&h->io_mtx);
+
+	return io;
+}
+
+static void rbd_put_io(struct rbd_io_handler *h, struct io *io)
+{
+	pthread_mutex_lock(&h->io_mtx);
+	h->ios[h->io_nr++] = io;
+	pthread_mutex_unlock(&h->io_mtx);
+}
+
 static void rbd_io_callback(rbd_completion_t comp, void *data)
 {
 	struct io *io = data;
@@ -89,6 +111,8 @@ static void rbd_io_callback(rbd_completion_t comp, void *data)
 	struct tcmulib_cmd *cmd = io->cmd;
 	struct iovec *iovec = cmd->iovec;
 	size_t iov_cnt = cmd->iov_cnt;
+	struct rbd_dev_state *state = tcmu_get_dev_private(dev);
+	struct rbd_io_handler *h = &state->h;
 	ssize_t ret;
 
 	ret = rbd_aio_get_return_value(io->completion);
@@ -103,6 +127,8 @@ static void rbd_io_callback(rbd_completion_t comp, void *data)
 
 	free(io->xfer_buf);
 	rbd_aio_release(io->completion);
+
+	rbd_put_io(h, io);
 }
 
 /*
@@ -260,11 +286,9 @@ static void *rbd_io_handler_entry(void *arg)
 		cmd = h->cmds[h->cmd_tail];
 		pthread_mutex_unlock(&h->cmd_mtx);
 
-		/* get a free io */
-		pthread_mutex_lock(&h->io_mtx);
-		io = h->ios[h->io_nr--];
-		h->ios[h->io_nr] = NULL;
-		pthread_mutex_unlock(&h->io_mtx);
+		/* get a io */
+		io = rbd_get_io(h);
+		assert(io);
 
 		/* attach the scsi command to the io */
 		io->cmd = cmd;
