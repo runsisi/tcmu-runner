@@ -11,8 +11,8 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
-#include <scsi/scsi.h>
 #include <rbd/librbd.h>
+#include <scsi/scsi.h>
 #include "tcmu-runner.h"
 #include "libtcmu.h"
 #include "rbd.h"
