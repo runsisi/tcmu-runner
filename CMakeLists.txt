@@ -29,6 +29,7 @@ find_library(PTHREAD pthread)
 find_library(DL dl)
 find_library(KMOD kmod)
 find_library(GFAPI gfapi)
+find_library(RBD rbd)
 
 # Stuff for building the shared library
 add_library(tcmu
@@ -135,6 +136,19 @@ set_target_properties(handler_qcow
   )
 target_link_libraries(handler_qcow
   ${ZLIB_LIBRARIES}
+  )
+
+# Stuff for building the rbd handler
+add_library(handler_rbd
+  SHARED
+  rbd.c
+  )
+set_target_properties(handler_rbd
+  PROPERTIES
+  PREFIX ""
+  )
+target_link_libraries(handler_rbd
+  ${RBD}
   )
 
 # stamp out a header file to pass some of the CMake settings
