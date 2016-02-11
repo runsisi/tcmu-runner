@@ -6,26 +6,15 @@
  */
 
 #define _GNU_SOURCE
-#include <stddef.h>
-#include <stdint.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <endian.h>
-#include <scsi/scsi.h>
 #include <errno.h>
-
-#include "tcmu-runner.h"
-
 #include <pthread.h>
 #include <signal.h>
-#include "libtcmu.h"
+#include <scsi/scsi.h>
 #include <rbd/librbd.h>
+#include "tcmu-runner.h"
+#include "libtcmu.h"
 #include "rbd.h"
 
 #define NCOMMANDS 16
@@ -58,7 +47,7 @@ struct rbd_io_handler {
 	struct io *ios[NCOMMANDS];
 };
 
-struct rbd_state {
+struct rbd_dev_state {
 	struct rbd_data rbd;
 	struct rbd_options options;
 	uint64_t num_lbas;
@@ -71,16 +60,16 @@ struct rbd_state {
 
 static int set_medium_error(uint8_t *sense);
 static void rbd_io_callback(rbd_completion_t comp, void *data);
-static int rbd_prepare_io(struct rbd_state *state, struct tcmulib_cmd *cmd, struct io *io);
-static int rbd_queue_io(struct rbd_state *state, struct io *io);
+static int rbd_prepare_io(struct rbd_dev_state *state, struct tcmulib_cmd *cmd, struct io *io);
+static int rbd_queue_io(struct rbd_dev_state *state, struct io *io);
 static void rbd_finish_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd, int result);
 static void *rbd_io_handler_entry(void *arg);
 static void rbd_io_handler_init(struct rbd_io_handler *h, struct tcmu_device *dev);
 static void rbd_io_handler_destroy(struct rbd_io_handler *h);
 static bool rbd_check_config(const char *cfgstring, char **reason);
 static void rbd_parse_imagepath(char *path, char **pool, char **image, char **snap);
-static int rbd_connect(struct rbd_state *state);
-static void rbd_disconnect(struct rbd_state *state);
+static int rbd_connect(struct rbd_dev_state *state);
+static void rbd_disconnect(struct rbd_dev_state *state);
 static int rbd_dev_open(struct tcmu_device *dev);
 static void rbd_dev_close(struct tcmu_device *dev);
 static bool rbd_can_fast_dispatch(struct tcmulib_cmd *cmd);
@@ -119,7 +108,7 @@ static void rbd_io_callback(rbd_completion_t comp, void *data)
 /*
  * Return scsi status or TCMU_NOT_HANDLED
  */
-static int rbd_prepare_io(struct rbd_state *state, struct tcmulib_cmd *cmd, struct io *io)
+static int rbd_prepare_io(struct rbd_dev_state *state, struct tcmulib_cmd *cmd, struct io *io)
 {
 	uint8_t *cdb = cmd->cdb;
 	struct iovec *iovec = cmd->iovec;
@@ -183,7 +172,7 @@ static int rbd_prepare_io(struct rbd_state *state, struct tcmulib_cmd *cmd, stru
 	}
 }
 
-static int rbd_queue_io(struct rbd_state *state, struct io *io)
+static int rbd_queue_io(struct rbd_dev_state *state, struct io *io)
 {
 	struct rbd_data *rbd = &state->rbd;
 	int r = -1;
@@ -237,7 +226,7 @@ failed:
 
 static void rbd_finish_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd, int result)
 {
-	struct rbd_state *state = tcmu_get_dev_private(dev);
+	struct rbd_dev_state *state = tcmu_get_dev_private(dev);
 	struct rbd_io_handler *h = &state->h;
 
 	pthread_mutex_lock(&state->completion_mtx);
@@ -256,7 +245,7 @@ static void rbd_finish_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd, int
 static void *rbd_io_handler_entry(void *arg)
 {
 	struct rbd_io_handler *h = (struct rbd_io_handler *)arg;
-	struct rbd_state *state = tcmu_get_dev_private(h->dev);
+	struct rbd_dev_state *state = tcmu_get_dev_private(h->dev);
 
 	for (;;) {
 		int result;
@@ -371,7 +360,7 @@ static void rbd_parse_imagepath(char *path, char **pool, char **image, char **sn
 	free(origp);
 }
 
-static int rbd_connect(struct rbd_state *state)
+static int rbd_connect(struct rbd_dev_state *state)
 {
 	struct rbd_data *rbd = &state->rbd;
 	struct rbd_options *opts = &state->options;
@@ -418,7 +407,7 @@ failed_early:
 	return 1;
 }
 
-static void rbd_disconnect(struct rbd_state *state)
+static void rbd_disconnect(struct rbd_dev_state *state)
 {
 	if (!state)
 		return;
@@ -443,7 +432,7 @@ static void rbd_disconnect(struct rbd_state *state)
 
 static int rbd_dev_open(struct tcmu_device *dev)
 {
-	struct rbd_state *state;
+	struct rbd_dev_state *state;
 	int64_t size;
 	char *config;
 
@@ -501,7 +490,7 @@ err:
 
 static void rbd_dev_close(struct tcmu_device *dev)
 {
-	struct rbd_state *state = tcmu_get_dev_private(dev);
+	struct rbd_dev_state *state = tcmu_get_dev_private(dev);
 
 	rbd_io_handler_destroy(&state->h);
 
@@ -543,7 +532,7 @@ static int rbd_fast_dispatch(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
 	struct iovec *iovec = cmd->iovec;
 	size_t iov_cnt = cmd->iov_cnt;
 	uint8_t *sense = cmd->sense_buf;
-	struct rbd_state *state = tcmu_get_dev_private(dev);
+	struct rbd_dev_state *state = tcmu_get_dev_private(dev);
 	uint8_t scsi_cmd;
 
 	scsi_cmd = cdb[0];
@@ -579,7 +568,7 @@ static int rbd_fast_dispatch(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
 
 static int rbd_dispatch(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
 {
-	struct rbd_state *state = tcmu_get_dev_private(dev);
+	struct rbd_dev_state *state = tcmu_get_dev_private(dev);
 	struct rbd_io_handler *h = &state->h;
 
 	/* enqueue command */
