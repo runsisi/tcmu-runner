@@ -5,7 +5,7 @@
 cat <<-EOF > /etc/ceph/ceph.conf
 [global]
     fsid = $(uuidgen)
-    osd pg bits = 3
+    osd pg bits = 5
     osd crush chooseleaf type = 0
     osd pool default min size = 1
     osd pool default size = 1
