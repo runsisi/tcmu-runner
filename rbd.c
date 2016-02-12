@@ -63,9 +63,10 @@ static int set_medium_error(uint8_t *sense);
 static struct io *rbd_get_io(struct rbd_io_handler *h);
 static void rbd_put_io(struct rbd_io_handler *h, struct io *io);
 static void rbd_io_callback(rbd_completion_t comp, void *data);
-static int rbd_prepare_io(struct rbd_dev_state *state, struct tcmulib_cmd *cmd, struct io *io);
-static int rbd_queue_io(struct rbd_dev_state *state, struct io *io);
-static void rbd_finish_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd, int result);
+static int rbd_prepare_io(struct rbd_io_handler *h, struct tcmulib_cmd *cmd, struct io *io);
+static int rbd_queue_io(struct rbd_io_handler *h, struct io *io);
+static struct tcmulib_cmd *rbd_get_cmd(struct rbd_io_handler *h);
+static void rbd_put_cmd(struct rbd_io_handler *h, struct tcmulib_cmd *cmd, int result);
 static void *rbd_io_handler_entry(void *arg);
 static void rbd_io_handler_init(struct rbd_io_handler *h, struct tcmu_device *dev);
 static void rbd_io_handler_destroy(struct rbd_io_handler *h);
@@ -123,7 +124,7 @@ static void rbd_io_callback(rbd_completion_t comp, void *data)
 	}
 
 	/* complete the scsi cmd */
-	rbd_finish_cmd(dev, cmd, ret);
+	rbd_put_cmd(h, cmd, ret);
 
 	free(io->xfer_buf);
 	rbd_aio_release(io->completion);
@@ -134,8 +135,9 @@ static void rbd_io_callback(rbd_completion_t comp, void *data)
 /*
  * Return scsi status or TCMU_NOT_HANDLED
  */
-static int rbd_prepare_io(struct rbd_dev_state *state, struct tcmulib_cmd *cmd, struct io *io)
+static int rbd_prepare_io(struct rbd_io_handler *h, struct tcmulib_cmd *cmd, struct io *io)
 {
+	struct rbd_dev_state *state = tcmu_get_dev_private(h->dev);
 	uint8_t *cdb = cmd->cdb;
 	struct iovec *iovec = cmd->iovec;
 	size_t iov_cnt = cmd->iov_cnt;
@@ -143,6 +145,8 @@ static int rbd_prepare_io(struct rbd_dev_state *state, struct tcmulib_cmd *cmd, 
 	uint8_t scsi_cmd;
 
 	scsi_cmd = cdb[0];
+
+	io->cmd = cmd;
 
 	switch (scsi_cmd) {
 	case READ_6:
@@ -154,7 +158,6 @@ static int rbd_prepare_io(struct rbd_dev_state *state, struct tcmulib_cmd *cmd, 
 		uint64_t offset = state->block_size * tcmu_get_lba(cdb);
 		int length = tcmu_get_xfer_length(cdb) * state->block_size;
 
-		/* Using this buf DTRT even if seek is beyond EOF */
 		buf = malloc(length);
 		if (!buf)
 			return set_medium_error(sense);
@@ -198,8 +201,12 @@ static int rbd_prepare_io(struct rbd_dev_state *state, struct tcmulib_cmd *cmd, 
 	}
 }
 
-static int rbd_queue_io(struct rbd_dev_state *state, struct io *io)
+/*
+ * Return scsi status or TCMU_NOT_HANDLED
+ */
+static int rbd_queue_io(struct rbd_io_handler *h, struct io *io)
 {
+	struct rbd_dev_state *state = tcmu_get_dev_private(h->dev);
 	struct rbd_data *rbd = &state->rbd;
 	int r = -1;
 
@@ -250,10 +257,23 @@ failed:
 	return IO_Q_COMPLETED;
 }
 
-static void rbd_finish_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd, int result)
+static struct tcmulib_cmd *rbd_get_cmd(struct rbd_io_handler *h)
 {
-	struct rbd_dev_state *state = tcmu_get_dev_private(dev);
-	struct rbd_io_handler *h = &state->h;
+	struct tcmulib_cmd *cmd;
+
+	pthread_mutex_lock(&h->cmd_mtx);
+	while (h->cmd_tail == h->cmd_head) {
+		pthread_cond_wait(&h->cmd_cond, &h->cmd_mtx);
+	}
+	cmd = h->cmds[h->cmd_tail];
+	pthread_mutex_unlock(&h->cmd_mtx);
+
+	return cmd;
+}
+
+static void rbd_put_cmd(struct rbd_io_handler *h, struct tcmulib_cmd *cmd, int result)
+{
+	struct rbd_dev_state *state = tcmu_get_dev_private(h->dev);
 
 	pthread_mutex_lock(&state->completion_mtx);
 	tcmulib_command_complete(h->dev, cmd, result);
@@ -271,7 +291,6 @@ static void rbd_finish_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd, int
 static void *rbd_io_handler_entry(void *arg)
 {
 	struct rbd_io_handler *h = (struct rbd_io_handler *)arg;
-	struct rbd_dev_state *state = tcmu_get_dev_private(h->dev);
 
 	for (;;) {
 		int result;
@@ -279,33 +298,26 @@ static void *rbd_io_handler_entry(void *arg)
 		struct io *io;
 
 		/* get next command */
-		pthread_mutex_lock(&h->cmd_mtx);
-		while (h->cmd_tail == h->cmd_head) {
-			pthread_cond_wait(&h->cmd_cond, &h->cmd_mtx);
-		}
-		cmd = h->cmds[h->cmd_tail];
-		pthread_mutex_unlock(&h->cmd_mtx);
+		cmd = rbd_get_cmd(h);
 
 		/* get a io */
 		io = rbd_get_io(h);
 		assert(io);
 
-		/* attach the scsi command to the io */
-		io->cmd = cmd;
-
 		/* prepare io */
-		result = rbd_prepare_io(state, cmd, io);
+		result = rbd_prepare_io(h, cmd, io);
 		if (result) {
+			rbd_put_cmd(h, cmd, result);
 			goto complete;
 		}
 
 		/* queue io */
-		rbd_queue_io(state, io);
+		rbd_queue_io(h, io);
 
 		continue;
 
 complete:
-		rbd_finish_cmd(h->dev, cmd, result);
+		rbd_put_cmd(h, cmd, result);
 	}
 
 	return NULL;
@@ -627,7 +639,7 @@ static struct tcmur_handler rbd_handler = {
 	.open = rbd_dev_open,
 	.close = rbd_dev_close,
 	.name = "RBD-backed Handler (example async code)",
-	.subtype = "rbd_async",
+	.subtype = "rbd",
 	.handle_cmd = rbd_dispatch_cmd,
 };
 
