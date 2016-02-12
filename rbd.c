@@ -68,7 +68,7 @@ static int set_medium_error(uint8_t *sense);
 static struct io *rbd_get_io(struct rbd_io_handler *h);
 static void rbd_put_io(struct io *io, int r);
 static void rbd_io_callback(rbd_completion_t comp, void *data);
-static int rbd_prepare_io(struct io *io);
+static int rbd_setup_io(struct io *io);
 static int rbd_queue_io(struct io *io);
 static void *rbd_io_handler_run(void *arg);
 static int rbd_io_handler_init(struct rbd_io_handler *h, struct tcmu_device *dev);
@@ -162,7 +162,7 @@ static void rbd_io_callback(rbd_completion_t comp, void *data) {
 /*
  * return 0 or SCSI error status
  */
-static int rbd_prepare_io(struct io *io)
+static int rbd_setup_io(struct io *io)
 {
     struct rbd_io_handler *h = io->h;
     struct tcmulib_cmd *cmd = io->cmd;
@@ -304,8 +304,8 @@ static void *rbd_io_handler_run(void *arg)
         /* get a io to handle */
         io = rbd_get_io(h);
 
-        /* setup io */
-        r = rbd_prepare_io(io);
+        /* setup io data */
+        r = rbd_setup_io(io);
         if (r) {
             rbd_put_io(io, r);
             continue;
