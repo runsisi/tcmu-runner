@@ -584,6 +584,8 @@ static void rbd_dev_close(struct tcmu_device *dev)
     struct rbd_state *state = tcmu_get_dev_private(dev);
     struct rbd_options *opts = &state->opts;
 
+    rbd_io_handler_destroy(&state->h);
+
     free(opts->cluster_name);
     free(opts->client_name);
     free(opts->pool_name);
@@ -593,8 +595,6 @@ static void rbd_dev_close(struct tcmu_device *dev)
     rbd_disconnect(state);
 
     pthread_mutex_destroy(&state->completion_mtx);
-
-    rbd_io_handler_destroy(&state->h);
 
     free(state);
 }
