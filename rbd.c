@@ -64,26 +64,6 @@ struct rbd_state {
     struct rbd_io_handler h;
 };
 
-static int set_medium_error(uint8_t *sense);
-static struct io *rbd_get_io(struct rbd_io_handler *h);
-static void rbd_put_io(struct io *io, int r);
-static void rbd_io_callback(rbd_completion_t comp, void *data);
-static int rbd_setup_io(struct io *io);
-static int rbd_queue_io(struct io *io);
-static void *rbd_io_handler_run(void *arg);
-static int rbd_io_handler_init(struct rbd_io_handler *h, struct tcmu_device *dev);
-static void rbd_io_handler_destroy(struct rbd_io_handler *h);
-static bool rbd_check_config(const char *cfgstring, char **reason);
-static int rbd_parse_imagepath(char *path, char **pool, char **image, char **snap);
-static int rbd_connect(struct rbd_state *state);
-static void rbd_disconnect(struct rbd_state *state);
-static int rbd_dev_open(struct tcmu_device *dev);
-static void rbd_dev_close(struct tcmu_device *dev);
-static bool rbd_can_fast_dispatch(struct tcmulib_cmd *cmd);
-static int rbd_fast_dispatch(struct tcmu_device *dev, struct tcmulib_cmd *cmd);
-static int rbd_dispatch(struct tcmu_device *dev, struct tcmulib_cmd *cmd);
-static int rbd_dispatch_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd);
-
 static int set_medium_error(uint8_t *sense)
 {
     return tcmu_set_sense_data(sense, MEDIUM_ERROR, ASC_READ_ERROR, NULL);
@@ -235,7 +215,7 @@ static int rbd_setup_io(struct io *io)
 /*
  * Return 0 or scsi error status
  */
-static int rbd_queue_io(struct io *io)
+static int rbd_do_io(struct io *io)
 {
     struct rbd_io_handler *h = io->h;
     struct tcmulib_cmd *cmd = io->cmd;
@@ -311,8 +291,8 @@ static void *rbd_io_handler_run(void *arg)
             continue;
         }
 
-        /* queue io */
-        r = rbd_queue_io(io);
+        /* do async io */
+        r = rbd_do_io(io);
         if (r) {
             rbd_put_io(io, r);
         }
