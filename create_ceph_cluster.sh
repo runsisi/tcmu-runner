@@ -5,6 +5,7 @@
 
 MON_ID="a"
 OSD_ID="0"
+MON_ADDR="127.0.0.1"
 
 keyring_fn=/etc/ceph/ceph.client.admin.keyring
 
@@ -73,7 +74,7 @@ cat <<-EOF > /etc/ceph/ceph.conf
     osd pool default min size = 1
     osd pool default size = 1
     auth supported = cephx
-    mon host = 192.168.33.10
+    mon host = ${MON_ADDR}
 [mon.a]
     host = $(hostname -s)
 EOF
