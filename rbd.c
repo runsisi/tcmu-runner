@@ -18,7 +18,7 @@
 #include "libtcmu.h"
 
 #define NCOMMANDS   16
-#define IODEPTH     64
+#define IODEPTH     32
 
 enum io_data_op {
     IO_D_READ   = 0,
