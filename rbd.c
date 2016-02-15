@@ -525,31 +525,31 @@ static int rbd_connect(struct rbd_state *state)
 
     r = rados_create(&rbd->cluster, opts->client_name);
     if (r < 0) {
-        errp("rados_create failed.\n");
+        errp("rados_create failed\n");
         goto out;
     }
 
     r = rados_conf_read_file(rbd->cluster, NULL);
     if (r < 0) {
-        errp("rados_conf_read_file failed.\n");
+        errp("rados_conf_read_file failed\n");
         goto out_shutdown;
     }
 
     r = rados_connect(rbd->cluster);
     if (r < 0) {
-        errp("rados_connect failed.\n");
+        errp("rados_connect failed\n");
         goto out_shutdown;
     }
 
     r = rados_ioctx_create(rbd->cluster, opts->pool_name, &rbd->ioctx);
     if (r < 0) {
-        errp("rados_ioctx_create failed.\n");
+        errp("rados_ioctx_create failed\n");
         goto out_shutdown;
     }
 
     r = rbd_open(rbd->ioctx, opts->image_name, &rbd->image, opts->snap_name);
     if (r < 0) {
-        errp("rbd_open failed.\n");
+        errp("rbd_open failed\n");
         goto out_destroy;
     }
 
