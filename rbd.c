@@ -23,8 +23,8 @@
 enum io_data_op {
     IO_D_READ   = 0,
     IO_D_WRITE  = 1,
-    IO_D_TRIM   = 2,
-    IO_D_SYNC   = 3,
+    IO_D_SYNC   = 2,
+    IO_D_TRIM   = 3,
 };
 
 enum {
@@ -40,6 +40,7 @@ struct io {
     unsigned long long offset;
     void *xfer_buf;
     unsigned long xfer_buflen;
+    unsigned long resid;
 
     struct rbd_handler *h;
     struct tcmulib_cmd *cmd;
@@ -87,10 +88,24 @@ struct rbd_state {
     uint64_t num_lbas;
     uint32_t block_size;
 
+    /*
+     * The below will all be 0 because the handler is now responsible for
+     * enabling support, and this handler does not yet do so.
+     */
+
+    /* write caching supported */
+    bool wce;
+    /* logical block provisioning (UNMAP) supported */
+    bool tpu;
+    /* logical block provisioning (WRITE_SAME) supported */
+    bool tpws;
+
     pthread_mutex_t completion_mtx;
 
     struct rbd_handler h;
 };
+
+static int rbd_do_io(struct io *io);
 
 static int set_medium_error(uint8_t *sense)
 {
@@ -175,54 +190,111 @@ static int rbd_setup_io(struct rbd_handler *h, struct tcmulib_cmd *cmd, struct i
     uint8_t *sense = cmd->sense_buf;
     uint8_t scsi_cmd;
     void *buf;
-    uint64_t offset;
-    int length;
+    uint32_t block_size = state->block_size;
+    uint64_t offset = block_size * tcmu_get_lba(cdb);
+    uint32_t length = block_size * tcmu_get_xfer_length(cdb);
     int r;
 
     scsi_cmd = cdb[0];
 
     switch (scsi_cmd) {
-    case READ_6:
-    case READ_10:
-    case READ_12:
-    case READ_16:
-        offset = state->block_size * tcmu_get_lba(cdb);
-        length = tcmu_get_xfer_length(cdb) * state->block_size;
-
+    case COMPARE_AND_WRITE:
+        /* Blocks are transferred twice, first the set that
+         * we compare to the existing data, and second the set
+         * to write if the compare was successful.
+         */
+        length >>= 1;
         buf = malloc(length);
         if (!buf) {
-            r = set_medium_error(sense);
+            r = tcmu_set_sense_data(sense, HARDWARE_ERROR,
+                    ASC_INTERNAL_TARGET_FAILURE, NULL);
             goto out;
         }
-        memset(buf, 0, length);
 
         io->data_op = IO_D_READ;
         io->offset = offset;
         io->xfer_buf = buf;
         io->xfer_buflen = length;
-
         break;
+    case SYNCHRONIZE_CACHE:
+    case SYNCHRONIZE_CACHE_16:
+        io->data_op = IO_D_SYNC;
+        break;
+    case WRITE_VERIFY:
+    case WRITE_VERIFY_12:
+    case WRITE_VERIFY_16:
     case WRITE_6:
     case WRITE_10:
     case WRITE_12:
     case WRITE_16:
-        offset = state->block_size * tcmu_get_lba(cdb);
-        length = be16toh(*((uint16_t *)&cdb[7])) * state->block_size;
+        buf = malloc(length);
+        if (!buf) {
+            r = set_medium_error(sense);
+            goto out;
+        }
+        tcmu_memcpy_from_iovec(buf, length, iovec, iov_cnt);
+
+        io->data_op = IO_D_WRITE;
+        io->offset = offset;
+        io->xfer_buf = buf;
+        io->xfer_buflen = length;
+        break;
+    case WRITE_SAME:
+    case WRITE_SAME_16:
+        /* WRITE_SAME used to punch hole in file */
+        if (cdb[1] & 0x08) {
+            io->data_op = IO_D_TRIM;
+            io->offset = offset;
+            io->xfer_buflen = length;
+            break;
+        }
 
         buf = malloc(length);
         if (!buf) {
             r = set_medium_error(sense);
             goto out;
         }
-        memset(buf, 0, length);
+        tcmu_memcpy_from_iovec(buf, length, iovec, iov_cnt);
+
+        uint32_t val32;
+        uint64_t val64;
+
+        switch (cdb[1] & 0x06) {
+        case 0x02: /* PBDATA==0 LBDATA==1 */
+            val32 = htobe32(offset);
+            memcpy(buf, &val32, 4);
+            break;
+        case 0x04: /* PBDATA==1 LBDATA==0 */
+            /* physical sector format */
+            /* hey this is wrong val! But how to fix? */
+            val64 = htobe64(offset);
+            memcpy(buf, &val64, 8);
+            break;
+        default:
+            /* FIXME */
+            errp("PBDATA and LBDATA set!!!\n");
+        }
 
         io->data_op = IO_D_WRITE;
         io->offset = offset;
         io->xfer_buf = buf;
+        io->xfer_buflen = block_size;
+        io->resid = length;
+        break;
+    case READ_6:
+    case READ_10:
+    case READ_12:
+    case READ_16:
+        buf = malloc(length);
+        if (!buf) {
+            r = set_medium_error(sense);
+            goto out;
+        }
+
+        io->data_op = IO_D_READ;
+        io->offset = offset;
+        io->xfer_buf = buf;
         io->xfer_buflen = length;
-
-        tcmu_memcpy_from_iovec(io->xfer_buf, io->xfer_buflen, iovec, iov_cnt);
-
         break;
     default:
         errp("unknown command %x\n", scsi_cmd);
@@ -244,21 +316,139 @@ static void rbd_io_callback(rbd_completion_t comp, void *data) {
     struct io *io = data;
     struct rbd_handler *h = io->h;
     struct tcmulib_cmd *cmd = io->cmd;
+    uint8_t *cdb = cmd->cdb;
     struct iovec *iovec = cmd->iovec;
     size_t iov_cnt = cmd->iov_cnt;
     uint8_t *sense = cmd->sense_buf;
+    uint8_t scsi_cmd;
     ssize_t ret;
-    int r;
+    struct rbd_state *state = tcmu_get_dev_private(h->dev);
+    uint32_t block_size = state->block_size;
+    uint32_t cmp_offset;
+    int r = 0;
 
     ret = rbd_aio_get_return_value(io->completion);
     if (ret < 0) {
         r = set_medium_error(sense);
     } else {
+        scsi_cmd = cdb[0];
+
         if (io->data_op == IO_D_READ) {
-            tcmu_memcpy_into_iovec(iovec, iov_cnt, io->xfer_buf,
-                    io->xfer_buflen);
+            switch (scsi_cmd) {
+            case COMPARE_AND_WRITE:
+                cmp_offset = tcmu_compare_with_iovec(io->xfer_buf, iovec,
+                        io->xfer_buflen);
+                if (cmp_offset != -1) {
+                    r = tcmu_set_sense_data(sense, MISCOMPARE,
+                            ASC_MISCOMPARE_DURING_VERIFY_OPERATION,
+                            &cmp_offset);
+                    break;
+                }
+
+                io->data_op = IO_D_WRITE;
+
+                /* TODO: set the real iov_cnt */
+                tcmu_seek_in_iovec(iovec, io->xfer_buflen);
+                tcmu_memcpy_from_iovec(io->xfer_buf, io->xfer_buflen, iovec,
+                        iov_cnt);
+
+                r = rbd_do_io(io);
+                if (!r) {
+                    return;
+                }
+                break;
+            case WRITE_VERIFY:
+            case WRITE_VERIFY_12:
+            case WRITE_VERIFY_16:
+                cmp_offset = tcmu_compare_with_iovec(io->xfer_buf, iovec,
+                        io->xfer_buflen);
+                if (cmp_offset != -1) {
+                    r = tcmu_set_sense_data(sense, MISCOMPARE,
+                            ASC_MISCOMPARE_DURING_VERIFY_OPERATION,
+                            &cmp_offset);
+                }
+                break;
+            default:
+                tcmu_memcpy_into_iovec(iovec, iov_cnt, io->xfer_buf,
+                        io->xfer_buflen);
+                break;
+            }
+        } else if (io->data_op == IO_D_WRITE) {
+            switch (scsi_cmd) {
+            case COMPARE_AND_WRITE:
+                /* If FUA or !WCE then sync */
+                if (((scsi_cmd != WRITE_6) && (cdb[1] & 0x8)) || !state->wce) {
+                    io->data_op = IO_D_SYNC;
+
+                    r = rbd_do_io(io);
+                    if (!r) {
+                        return;
+                    }
+                }
+                break;
+            case WRITE_VERIFY:
+            case WRITE_VERIFY_12:
+            case WRITE_VERIFY_16:
+                /* verify */
+                tcmu_memcpy_into_iovec(iovec, iov_cnt, io->xfer_buf,
+                        io->xfer_buflen);
+
+                io->data_op = IO_D_READ;
+
+                r = rbd_do_io(io);
+                if (!r) {
+                    return;
+                }
+                break;
+            case WRITE_SAME:
+            case WRITE_SAME_16:
+                io->offset += block_size;
+                io->resid -= block_size;
+
+                if (io->resid) {
+                    uint32_t val32;
+                    uint64_t val64;
+
+                    switch (cdb[1] & 0x06) {
+                    case 0x02: /* PBDATA==0 LBDATA==1 */
+                        val32 = htobe32(io->offset);
+                        memcpy(io->xfer_buf, &val32, 4);
+                        break;
+                    case 0x04: /* PBDATA==1 LBDATA==0 */
+                        /* physical sector format */
+                        /* hey this is wrong val! But how to fix? */
+                        val64 = htobe64(io->offset);
+                        memcpy(io->xfer_buf, &val64, 8);
+                        break;
+                    default:
+                        /* FIXME */
+                        errp("PBDATA and LBDATA set!!!\n");
+                    }
+
+                    io->data_op = IO_D_WRITE;
+
+                    r = rbd_do_io(io);
+                    if (!r) {
+                        return;
+                    }
+                }
+                break;
+            default:
+                break;
+            }
+        } else if (io->data_op == IO_D_TRIM) {
+            switch (scsi_cmd) {
+            case WRITE_SAME:
+            case WRITE_SAME_16:
+                if (cdb[1] & 0x08) {
+                    /* rbd_aio_discard always return 0 */
+                    break;
+                }
+                break;
+            default:
+                break;
+            }
         }
-        r = 0;
     }
 
     free(io->xfer_buf);
@@ -286,15 +476,7 @@ static int rbd_do_io(struct io *io)
         goto out;
     }
 
-    if (io->data_op == IO_D_WRITE) {
-        r = rbd_aio_write(rbd->image, io->offset, io->xfer_buflen, io->xfer_buf,
-                io->completion);
-        if (r < 0) {
-            errp("rbd_aio_write failed, code: %d\n", r);
-            goto out_release;
-        }
-
-    } else if (io->data_op == IO_D_READ) {
+    if (io->data_op == IO_D_READ) {
         r = rbd_aio_read(rbd->image, io->offset, io->xfer_buflen, io->xfer_buf,
                 io->completion);
 
@@ -302,17 +484,24 @@ static int rbd_do_io(struct io *io)
             errp("rbd_aio_read failed, code: %d\n", r);
             goto out_release;
         }
-    } else if (io->data_op == IO_D_TRIM) {
-        r = rbd_aio_discard(rbd->image, io->offset, io->xfer_buflen,
+    } else if (io->data_op == IO_D_WRITE) {
+        r = rbd_aio_write(rbd->image, io->offset, io->xfer_buflen, io->xfer_buf,
                 io->completion);
         if (r < 0) {
-            errp("rbd_aio_discard failed, code: %d\n", r);
+            errp("rbd_aio_write failed, code: %d\n", r);
             goto out_release;
         }
     } else if (io->data_op == IO_D_SYNC) {
         r = rbd_aio_flush(rbd->image, io->completion);
         if (r < 0) {
             errp("rbd_aio_flush failed, code: %d\n", r);
+            goto out_release;
+        }
+    } else if (io->data_op == IO_D_TRIM) {
+        r = rbd_aio_discard(rbd->image, io->offset, io->xfer_buflen,
+                io->completion);
+        if (r < 0) {
+            errp("rbd_aio_discard failed, code: %d\n", r);
             goto out_release;
         }
     } else {
@@ -676,25 +865,38 @@ static void rbd_dev_close(struct tcmu_device *dev)
     free(state);
 }
 
-static bool rbd_can_fast_dispatch(struct tcmulib_cmd *cmd)
+int rbd_can_fast_dispatch(struct rbd_state *state, struct tcmulib_cmd *cmd)
 {
     uint8_t *cdb = cmd->cdb;
     uint8_t scsi_cmd = cdb[0];
-    bool fast_op = false;
+    bool fast_op = true;
 
     switch (scsi_cmd) {
-    case READ_6:
-    case READ_10:
-    case READ_12:
-    case READ_16:
+    case COMPARE_AND_WRITE:
+    case WRITE_VERIFY:
+    case WRITE_VERIFY_12:
+    case WRITE_VERIFY_16:
     case WRITE_6:
     case WRITE_10:
     case WRITE_12:
     case WRITE_16:
+    case READ_6:
+    case READ_10:
+    case READ_12:
+    case READ_16:
         fast_op = false;
         break;
+    case SYNCHRONIZE_CACHE:
+    case SYNCHRONIZE_CACHE_16:
+        if (!(cdb[1] & 0x2))
+            fast_op = false;
+        break;
+    case WRITE_SAME:
+    case WRITE_SAME_16:
+        if (state->tpws)
+            fast_op = false;
+        break;
     default:
-        fast_op = true;
         break;
     }
 
@@ -733,8 +935,33 @@ static int rbd_fast_dispatch(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
     case MODE_SELECT_10:
         r = tcmu_emulate_mode_select(cdb, iovec, iov_cnt, sense);
         break;
+    case SYNCHRONIZE_CACHE:
+    case SYNCHRONIZE_CACHE_16:
+        if (cdb[1] & 0x2) {
+            r = tcmu_set_sense_data(sense, ILLEGAL_REQUEST,
+                    ASC_INVALID_FIELD_IN_CDB, NULL);
+        }
+        break;
+    case WRITE_SAME:
+    case WRITE_SAME_16:
+        if (!state->tpws) {
+            r = tcmu_set_sense_data(sense, ILLEGAL_REQUEST,
+                    ASC_INVALID_FIELD_IN_CDB, NULL);
+        }
+        break;
+    case UNMAP:
+        if (!state->tpu) {
+            r = tcmu_set_sense_data(sense, ILLEGAL_REQUEST,
+                    ASC_INVALID_FIELD_IN_CDB, NULL);
+            break;
+        }
+
+        /* TODO: implement UNMAP */
+        r = tcmu_set_sense_data(sense, ILLEGAL_REQUEST,
+                ASC_INVALID_FIELD_IN_CDB, NULL);
+        break;
     default:
-        errp("unknown command %x\n", cdb[0]);
+        break;
     }
 
     return r;
@@ -760,7 +987,9 @@ static int rbd_dispatch(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
 
 static int rbd_dispatch_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
 {
-    if (rbd_can_fast_dispatch(cmd)) {
+    struct rbd_state *state = tcmu_get_dev_private(dev);
+
+    if (rbd_can_fast_dispatch(state, cmd)) {
         return rbd_fast_dispatch(dev, cmd);
     }
 
