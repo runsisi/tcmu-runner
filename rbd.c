@@ -525,31 +525,31 @@ static int rbd_connect(struct rbd_state *state)
 
     r = rados_create(&rbd->cluster, opts->client_name);
     if (r < 0) {
-        errp("rados_create failed\n");
+        errp("rados_create failed, code: %d\n", r);
         goto out;
     }
 
     r = rados_conf_read_file(rbd->cluster, NULL);
     if (r < 0) {
-        errp("rados_conf_read_file failed\n");
+        errp("rados_conf_read_file failed, code: %d\n", r);
         goto out_shutdown;
     }
 
     r = rados_connect(rbd->cluster);
     if (r < 0) {
-        errp("rados_connect failed\n");
+        errp("rados_connect failed, code: %d\n", r);
         goto out_shutdown;
     }
 
     r = rados_ioctx_create(rbd->cluster, opts->pool_name, &rbd->ioctx);
     if (r < 0) {
-        errp("rados_ioctx_create failed\n");
+        errp("rados_ioctx_create failed, code: %d\n", r);
         goto out_shutdown;
     }
 
     r = rbd_open(rbd->ioctx, opts->image_name, &rbd->image, opts->snap_name);
     if (r < 0) {
-        errp("rbd_open failed\n");
+        errp("rbd_open failed, code: %d\n", r);
         goto out_destroy;
     }
 
@@ -562,7 +562,7 @@ out_shutdown:
     rados_shutdown(rbd->cluster);
     rbd->cluster = NULL;
 out:
-    return 1;
+    return r;
 }
 
 static void rbd_disconnect(struct rbd_state *state)
@@ -635,8 +635,9 @@ static int rbd_dev_open(struct tcmu_device *dev)
     state->opts.client_name = strdup("client.admin");
 
     /* connect */
-    if (rbd_connect(state) < 0) {
-        errp("failed to connect to rbd\n");
+    r = rbd_connect(state);
+    if (r) {
+        errp("connect to rbd failed, code: %d\n", r);
         goto out;
     }
 
@@ -644,6 +645,7 @@ static int rbd_dev_open(struct tcmu_device *dev)
 
     r = rbd_handler_init(&state->h, dev);
     if (r) {
+        errp("init rbd handler failed, code: %d\n", r);
         goto out;
     }
 
