@@ -18,7 +18,7 @@
 #include "libtcmu.h"
 
 #define NCOMMANDS   16
-#define IODEPTH     32
+#define IODEPTH     64
 
 enum io_data_op {
     IO_D_READ   = 0,
@@ -371,6 +371,7 @@ static void *rbd_handler_run(void *arg)
         if (r) {
             rbd_put_cmd(h, cmd, r);
             rbd_put_io(h, io);
+            continue;
         }
     }
 
@@ -379,9 +380,7 @@ static void *rbd_handler_run(void *arg)
         if (h->all_ios[i]->flags & IO_F_PENDING) {
             rbd_put_cmd(h, cmd, TCMU_NOT_HANDLED);
         } else if (h->all_ios[i]->flags & IO_F_INFLIGHT) {
-            rbd_aio_release(io->completion);
-            rbd_put_cmd(h, cmd, TCMU_NOT_HANDLED);
-            rbd_put_io(h, io);
+            rbd_aio_wait_for_complete(io->completion);
         }
     }
 
@@ -661,6 +660,9 @@ static void rbd_dev_close(struct tcmu_device *dev)
     struct rbd_state *state = tcmu_get_dev_private(dev);
     struct rbd_options *opts = &state->opts;
 
+    /* disconnect */
+    rbd_disconnect(state);
+
     rbd_handler_destroy(&state->h);
 
     free(opts->cluster_name);
@@ -668,8 +670,6 @@ static void rbd_dev_close(struct tcmu_device *dev)
     free(opts->pool_name);
     free(opts->image_name);
     free(opts->snap_name);
-
-    rbd_disconnect(state);
 
     pthread_mutex_destroy(&state->completion_mtx);
 
