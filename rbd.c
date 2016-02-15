@@ -523,7 +523,7 @@ static int rbd_connect(struct rbd_state *state)
     struct rbd_options *opts = &state->opts;
     int r;
 
-    r = rados_create(&rbd->cluster, opts->client_name);
+    r = rados_create(&rbd->cluster, NULL);
     if (r < 0) {
         errp("rados_create failed, code: %d\n", r);
         goto out;
