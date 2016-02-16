@@ -21,10 +21,10 @@
 #define IODEPTH     32
 
 enum io_data_op {
-    IO_D_READ   = 0,
-    IO_D_WRITE  = 1,
-    IO_D_SYNC   = 2,
-    IO_D_TRIM   = 3,
+    IO_D_READ       = 0,
+    IO_D_WRITE      = 1,
+    IO_D_FLUSH      = 2,
+    IO_D_DISCARD    = 3,
 };
 
 enum {
@@ -66,7 +66,6 @@ struct rbd_handler {
     int stop;
 
     pthread_mutex_t mtx;
-
     pthread_mutex_t io_mtx;
     pthread_cond_t io_cond;
 
@@ -127,7 +126,6 @@ static int rbd_handler_init(struct rbd_handler *h, struct tcmu_device *dev)
     h->stop = 0;
 
     pthread_mutex_init(&h->mtx, NULL);
-
     pthread_mutex_init(&h->io_mtx, NULL);
     pthread_cond_init(&h->io_cond, NULL);
 
@@ -142,9 +140,18 @@ static int rbd_handler_init(struct rbd_handler *h, struct tcmu_device *dev)
 
 static void rbd_handler_destroy(struct rbd_handler *h)
 {
+    while (h->free_io_nr != IODEPTH) {
+
+    }
+
+    pthread_mutex_lock(&h->io_mtx);
+    while (h->free_io_nr != IODEPTH) {
+        pthread_cond_wait(&h->io_cond, &h->io_mtx);
+    }
+    pthread_mutex_unlock(&h->io_mtx);
+
     pthread_cond_destroy(&h->io_cond);
     pthread_mutex_destroy(&h->io_mtx);
-
     pthread_mutex_destroy(&h->mtx);
 }
 
@@ -377,7 +384,7 @@ static void rbd_dev_close(struct tcmu_device *dev)
 
 static struct io *rbd_get_io(struct rbd_handler *h)
 {
-    struct io *io;
+    struct io *io = NULL;
 
     pthread_mutex_lock(&h->io_mtx);
     while (!h->free_io_nr) {
@@ -480,7 +487,7 @@ static void rbd_io_callback(rbd_completion_t comp, void *data) {
         case COMPARE_AND_WRITE:
             /* If FUA or !WCE then sync */
             if (((scsi_cmd != WRITE_6) && (cdb[1] & 0x8)) || !state->wce) {
-                io->data_op = IO_D_SYNC;
+                io->data_op = IO_D_FLUSH;
 
                 result = rbd_do_io(io);
             }
@@ -530,7 +537,7 @@ static void rbd_io_callback(rbd_completion_t comp, void *data) {
             break;
         }
         break;
-    case IO_D_TRIM:
+    case IO_D_DISCARD:
         switch (scsi_cmd) {
         case WRITE_SAME:
         case WRITE_SAME_16:
@@ -593,14 +600,14 @@ static int rbd_do_io(struct io *io)
             result = set_medium_error(sense);
         }
         break;
-    case IO_D_SYNC:
+    case IO_D_FLUSH:
         r = rbd_aio_flush(rbd->image, io->completion);
         if (r < 0) {
             errp("rbd_aio_flush failed, code: %d\n", r);
             result = set_medium_error(sense);
         }
         break;
-    case IO_D_TRIM:
+    case IO_D_DISCARD:
         r = rbd_aio_discard(rbd->image, io->offset, io->xfer_buflen,
                 io->completion);
         if (r < 0) {
@@ -696,7 +703,7 @@ static int rbd_handle_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
                 result = TCMU_NOT_HANDLED;
                 break;
             }
-            io->data_op = IO_D_SYNC;
+            io->data_op = IO_D_FLUSH;
         }
         break;
     case WRITE_VERIFY:
@@ -740,7 +747,7 @@ static int rbd_handle_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
                 result = TCMU_NOT_HANDLED;
                 break;
             }
-            io->data_op = IO_D_TRIM;
+            io->data_op = IO_D_DISCARD;
             io->offset = offset;
             io->xfer_buflen = length;
             break;
