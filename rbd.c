@@ -17,7 +17,6 @@
 #include "tcmu-runner.h"
 #include "libtcmu.h"
 
-#define NCOMMANDS   16
 #define IODEPTH     32
 
 enum io_data_op {
@@ -68,10 +67,6 @@ struct rbd_handler {
     pthread_mutex_t mtx;
     pthread_mutex_t io_mtx;
     pthread_cond_t io_cond;
-
-    int cmd_head;
-    int cmd_tail;
-    struct tcmulib_cmd *cmds[NCOMMANDS];
 
     int free_io_nr;
     struct io *free_ios[IODEPTH];
