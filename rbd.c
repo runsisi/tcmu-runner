@@ -135,10 +135,6 @@ static int rbd_handler_init(struct rbd_handler *h, struct tcmu_device *dev)
 
 static void rbd_handler_destroy(struct rbd_handler *h)
 {
-    while (h->free_io_nr != IODEPTH) {
-
-    }
-
     pthread_mutex_lock(&h->io_mtx);
     while (h->free_io_nr != IODEPTH) {
         pthread_cond_wait(&h->io_cond, &h->io_mtx);
