@@ -127,19 +127,13 @@ struct rbd_aio_cb {
 static int tcmu_rbd_aio_epfd = -1;
 static pthread_t *tcmu_rbd_aio_threads = NULL;
 
-static void rbd_finish_aio_generic_(rbd_completion_t completion,
+static void rbd_finish_aio_generic(rbd_completion_t completion,
         struct rbd_aio_cb *aio_cb);
-static void rbd_finish_aio_generic(rbd_completion_t cb, void *arg);
 
 static int tcmu_rbd_handler_init();
 static void *tcmu_rbd_aio_poller(void *arg);
 static int tcmu_rbd_setup_aio_poll(struct tcmu_device *dev, int epfd);
 static void tcmu_rbd_teardown_aio_poll(struct tcmu_device *dev, int epfd);
-
-static void rbd_finish_aio_generic(rbd_completion_t cb, void *arg)
-{
-    /* polling mode w/o aio cb, do nothing */
-}
 
 static int tcmu_rbd_handler_init()
 {
@@ -227,7 +221,7 @@ static void *tcmu_rbd_aio_poller(void *arg)
                     tcmu_dev_warn(dev, "decrement semaphore failed. Err %d.\n", ret);
                 }
 
-                rbd_finish_aio_generic_(comps[j], aio_cb);
+                rbd_finish_aio_generic(comps[j], aio_cb);
             }
         }
     }
@@ -1265,7 +1259,7 @@ static int tcmu_rbd_aio_write(struct tcmu_device *dev, struct rbd_aio_cb *aio_cb
  * the only errno we've to bother about as of now are memory
  * allocation errors.
  */
-static void rbd_finish_aio_generic_(rbd_completion_t completion,
+static void rbd_finish_aio_generic(rbd_completion_t completion,
 				   struct rbd_aio_cb *aio_cb)
 {
 	struct tcmu_device *dev = aio_cb->dev;
@@ -1338,7 +1332,7 @@ static int tcmu_rbd_read(struct tcmu_device *dev, struct tcmur_cmd *tcmur_cmd,
 	aio_cb->iov_cnt = iov_cnt;
 
 	ret = rbd_aio_create_completion
-		(aio_cb, (rbd_callback_t) rbd_finish_aio_generic, &completion);
+		(aio_cb, NULL, &completion);
 	if (ret < 0) {
 		goto out_free_aio_cb;
 	}
@@ -1377,7 +1371,7 @@ static int tcmu_rbd_write(struct tcmu_device *dev, struct tcmur_cmd *tcmur_cmd,
 	aio_cb->tcmur_cmd = tcmur_cmd;
 
 	ret = rbd_aio_create_completion
-		(aio_cb, (rbd_callback_t) rbd_finish_aio_generic, &completion);
+		(aio_cb, NULL, &completion);
 	if (ret < 0) {
 		goto out_free_aio_cb;
 	}
@@ -1419,7 +1413,7 @@ static int tcmu_rbd_unmap(struct tcmu_device *dev, struct tcmur_cmd *tcmur_cmd,
 	aio_cb->bounce_buffer = NULL;
 
 	ret = rbd_aio_create_completion
-		(aio_cb, (rbd_callback_t) rbd_finish_aio_generic, &completion);
+		(aio_cb, NULL, &completion);
 	if (ret < 0)
 		goto out_free_aio_cb;
 
@@ -1459,7 +1453,7 @@ static int tcmu_rbd_flush(struct tcmu_device *dev, struct tcmur_cmd *tcmur_cmd)
 	aio_cb->bounce_buffer = NULL;
 
 	ret = rbd_aio_create_completion
-		(aio_cb, (rbd_callback_t) rbd_finish_aio_generic, &completion);
+		(aio_cb, NULL, &completion);
 	if (ret < 0) {
 		goto out_free_aio_cb;
 	}
@@ -1512,7 +1506,7 @@ static int tcmu_rbd_aio_writesame(struct tcmu_device *dev,
 	tcmu_memcpy_from_iovec(aio_cb->bounce_buffer, length, iov, iov_cnt);
 
 	ret = rbd_aio_create_completion
-		(aio_cb, (rbd_callback_t) rbd_finish_aio_generic, &completion);
+		(aio_cb, NULL, &completion);
 	if (ret < 0)
 		goto out_free_bounce_buffer;
 
@@ -1569,7 +1563,7 @@ static int tcmu_rbd_aio_caw(struct tcmu_device *dev, struct tcmur_cmd *tcmur_cmd
 			       iov_cnt);
 
 	ret = rbd_aio_create_completion(
-		aio_cb, (rbd_callback_t) rbd_finish_aio_generic, &completion);
+		aio_cb, NULL, &completion);
 	if (ret < 0) {
 		goto out_free_bounce_buffer;
 	}
