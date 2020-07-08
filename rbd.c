@@ -124,8 +124,33 @@ struct rbd_aio_cb {
 #define TCMU_RBD_MAX_REVENTS        128 /* rbd device nr. */
 #define TCMU_RBD_AIO_QUEUE_DEPTH    512 /* rbd device io depth */
 
+static int tcmu_rbd_nr_aio_threads = TCMU_RBD_NR_AIO_THREADS;
+static int tcmu_rbd_max_revents = TCMU_RBD_MAX_REVENTS;
+static int tcmu_rbd_aio_queue_depth = TCMU_RBD_AIO_QUEUE_DEPTH;
+
 static int tcmu_rbd_aio_epfd = -1;
 static pthread_t *tcmu_rbd_aio_threads = NULL;
+
+/*
+ * https://github.com/cirosantilli/cpp-cheat/blob/master/c/str2num.h
+ */
+int str2int(int *out, char *s, int base) {
+    char *end;
+    long l;
+    if (s[0] == '\0' || isspace(s[0]))
+        return -1;
+    errno = 0;
+    l = strtol(s, &end, base);
+    /* Both checks are needed because INT_MAX == LONG_MAX is possible. */
+    if (l > INT_MAX || (errno == ERANGE && l == LONG_MAX))
+        return -1;
+    if (l < INT_MIN || (errno == ERANGE && l == LONG_MIN))
+        return -1;
+    if (*end != '\0')
+        return -1;
+    *out = l;
+    return 0;
+}
 
 static void rbd_finish_aio_generic(rbd_completion_t completion,
         struct rbd_aio_cb *aio_cb);
@@ -138,8 +163,41 @@ static void tcmu_rbd_teardown_aio_poll(struct tcmu_device *dev, int epfd);
 static int tcmu_rbd_handler_init()
 {
     int ret;
+    char *env_nr_threads, *env_max_revents, *env_q_depth;
+    int nr_threads, max_revents, q_depth;
     int i;
-    int nr_threads = TCMU_RBD_NR_AIO_THREADS;
+
+    env_nr_threads = getenv("TCMU_RBD_NR_AIO_THREADS");
+    env_max_revents = getenv("TCMU_RBD_MAX_REVENTS");
+    env_q_depth = getenv("TCMU_RBD_AIO_QUEUE_DEPTH");
+
+    if (env_nr_threads) {
+        ret = str2int(&nr_threads, env_nr_threads, 10);
+        if (ret < 0 || nr_threads < 1 || nr_threads > 100) {
+            ret = -EINVAL;
+            tcmu_err("invalid env setting for TCMU_RBD_NR_AIO_THREADS=%s", env_nr_threads);
+            goto out;
+        }
+        tcmu_rbd_nr_aio_threads = nr_threads;
+    }
+    if (env_max_revents) {
+        ret = str2int(&max_revents, env_max_revents, 10);
+        if (ret < 0 || max_revents < 1 || max_revents > 1000) {
+            ret = -EINVAL;
+            tcmu_err("invalid env setting for TCMU_RBD_MAX_REVENTS=%s", env_max_revents);
+            goto out;
+        }
+        tcmu_rbd_max_revents = max_revents;
+    }
+    if (env_q_depth) {
+        ret = str2int(&q_depth, env_q_depth, 10);
+        if (ret < 0 || q_depth < 1 || q_depth > 1000) {
+            ret = -EINVAL;
+            tcmu_err("invalid env setting for TCMU_RBD_AIO_QUEUE_DEPTH=%s", env_q_depth);
+            goto out;
+        }
+        tcmu_rbd_aio_queue_depth = q_depth;
+    }
 
     tcmu_rbd_aio_epfd = epoll_create1(EPOLL_CLOEXEC);
     if (tcmu_rbd_aio_epfd < 0) {
@@ -148,14 +206,14 @@ static int tcmu_rbd_handler_init()
         goto out;
     }
 
-    tcmu_rbd_aio_threads = calloc(nr_threads, sizeof(pthread_t));
+    tcmu_rbd_aio_threads = calloc(tcmu_rbd_nr_aio_threads, sizeof(pthread_t));
     if (!tcmu_rbd_aio_threads) {
         ret = ENOMEM;
         tcmu_err("alloc mem for thread ptrs failed.\n");
         goto cleanup_epfd;
     }
 
-    for (i = 0; i < nr_threads; i++) {
+    for (i = 0; i < tcmu_rbd_nr_aio_threads; i++) {
         ret = pthread_create(&tcmu_rbd_aio_threads[i], NULL,
                 tcmu_rbd_aio_poller, &tcmu_rbd_aio_epfd);
         if (ret != 0) {
@@ -167,7 +225,7 @@ static int tcmu_rbd_handler_init()
     return 0;
 
 cleanup_threads:
-    for (i = 0; i < nr_threads; i++) {
+    for (i = 0; i < tcmu_rbd_nr_aio_threads; i++) {
         if (tcmu_rbd_aio_threads[i]) {
             tcmu_thread_cancel(tcmu_rbd_aio_threads[i]);
         }
@@ -188,8 +246,8 @@ static void *tcmu_rbd_aio_poller(void *arg)
     struct tcmu_device *dev;
     struct tcmu_rbd_state *state;
     /* ulimit -S -s, thread stack space should be enough */
-    struct epoll_event revents[TCMU_RBD_MAX_REVENTS] = {{0}};
-    rbd_completion_t comps[TCMU_RBD_AIO_QUEUE_DEPTH];
+    struct epoll_event revents[tcmu_rbd_max_revents];
+    rbd_completion_t comps[tcmu_rbd_aio_queue_depth];
     int aio_nr;
     struct rbd_aio_cb *aio_cb;
     uint64_t counter;
@@ -197,7 +255,7 @@ static void *tcmu_rbd_aio_poller(void *arg)
     tcmu_set_thread_name("poller", NULL);
 
     while (1) {
-        ret = epoll_wait(epfd, revents, TCMU_RBD_MAX_REVENTS, -1);
+        ret = epoll_wait(epfd, revents, tcmu_rbd_max_revents, -1);
         if (ret <= 0) {
             continue;
         }
@@ -210,7 +268,7 @@ static void *tcmu_rbd_aio_poller(void *arg)
             dev = revents[i].data.ptr;
             state = tcmur_dev_get_private(dev);
 
-            aio_nr = rbd_poll_io_events(state->image, comps, TCMU_RBD_AIO_QUEUE_DEPTH);
+            aio_nr = rbd_poll_io_events(state->image, comps, tcmu_rbd_aio_queue_depth);
             for (j = 0; j < aio_nr; j++) {
                 aio_cb = rbd_aio_get_arg(comps[j]);
 
