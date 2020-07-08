@@ -33,6 +33,9 @@
 #include <rbd/librbd.h>
 #include <rados/librados.h>
 
+#include <poll.h>
+#include <sys/eventfd.h>
+
 /*
  * rbd_lock_acquire exclusive lock support was added in librbd 0.1.11
  */
@@ -74,6 +77,9 @@ struct tcmu_rbd_state {
 	rados_t cluster;
 	rados_ioctx_t io_ctx;
 	rbd_image_t image;
+
+	int fd; /* poll aio completion */
+	pthread_t poller;
 
 	char *image_name;
 	char *pool_name;
@@ -831,6 +837,98 @@ static int tcmu_rbd_check_image_size(struct tcmu_device *dev, uint64_t new_size)
 	return 0;
 }
 
+static void rbd_finish_aio_generic_(rbd_completion_t completion,
+        struct rbd_aio_cb *aio_cb);
+
+static void *tcmu_rbd_poller(void *arg)
+{
+#define TCMU_RBD_QUEUE_DEPTH 128
+
+    struct tcmu_device *dev = arg;
+    struct tcmu_rbd_state *state = tcmur_dev_get_private(dev);
+    int ret;
+    int i;
+    int event_num;
+    struct rbd_aio_cb *aio_cb;
+    rbd_completion_t comps[TCMU_RBD_QUEUE_DEPTH];
+    uint64_t counter;
+
+    struct pollfd pfd;
+    pfd.fd = state->fd;
+    pfd.events = POLLIN;
+
+    tcmu_set_thread_name("poller", dev);
+
+    while (1) {
+        ret = poll(&pfd, 1, -1);
+        if (ret <= 0)
+            continue;
+        if (!(pfd.revents & POLLIN))
+            continue;
+
+        event_num = rbd_poll_io_events(state->image, comps, TCMU_RBD_QUEUE_DEPTH);
+
+        for (i = 0; i < event_num; i++) {
+            aio_cb = rbd_aio_get_arg(comps[i]);
+
+            /* decrement the semaphore */
+            ret = read(state->fd, &counter, sizeof(counter));
+            if (ret <= 0) {
+                ret = -errno;
+                tcmu_dev_err(dev, "decrement semaphore failed. Err %d.\n", ret);
+            }
+
+            rbd_finish_aio_generic_(comps[i], aio_cb);
+        }
+    }
+
+    return NULL;
+}
+
+static void rbd_finish_aio_generic(rbd_completion_t cb, void *arg)
+{
+    /* polling mode w/o aio cb */
+}
+
+static int tcmu_rbd_setup_poll(struct tcmu_device *dev)
+{
+    struct tcmu_rbd_state *state = tcmur_dev_get_private(dev);
+    int ret;
+
+    state->fd = eventfd(0, EFD_SEMAPHORE);
+    if (state->fd < 0) {
+        ret = -errno;
+        tcmu_dev_err(dev, "create eventfd failed. Err %d.\n", ret);
+        return ret;
+    }
+
+    ret = rbd_set_image_notification(state->image, state->fd, EVENT_TYPE_EVENTFD);
+    if (ret < 0) {
+        tcmu_dev_err(dev, "rbd_set_image_notification failed. Err %d.\n", ret);
+        close(state->fd);
+        state->fd = -1;
+        return ret;
+    }
+
+    ret = pthread_create(&state->poller, NULL, tcmu_rbd_poller, dev);
+    if (ret != 0) {
+        tcmu_dev_err(dev, "pthread_create failed. Err %d.\n", ret);
+        return ret;
+    }
+
+    return 0;
+}
+
+static void tcmu_rbd_teardown_poll(struct tcmu_device *dev)
+{
+    struct tcmu_rbd_state *state = tcmur_dev_get_private(dev);
+
+    close(state->fd);
+    tcmu_thread_cancel(state->poller);
+
+    state->fd = -1;
+}
+
 static int tcmu_rbd_open(struct tcmu_device *dev, bool reopen)
 {
 	rbd_image_info_t image_info;
@@ -952,6 +1050,11 @@ static int tcmu_rbd_open(struct tcmu_device *dev, bool reopen)
 				    tcmu_dev_get_block_size(dev), false);
 	tcmu_dev_set_write_cache_enabled(dev, 0);
 
+	ret = tcmu_rbd_setup_poll(dev);
+	if (ret) {
+	    goto stop_image;
+	}
+
 	free(dev_cfg_dup);
 	return 0;
 
@@ -967,6 +1070,8 @@ free_state:
 static void tcmu_rbd_close(struct tcmu_device *dev)
 {
 	struct tcmu_rbd_state *state = tcmur_dev_get_private(dev);
+
+	tcmu_rbd_teardown_poll(dev);
 
 	tcmu_rbd_image_close(dev);
 	tcmu_rbd_state_free(state);
@@ -1074,7 +1179,7 @@ static int tcmu_rbd_aio_write(struct tcmu_device *dev, struct rbd_aio_cb *aio_cb
  * the only errno we've to bother about as of now are memory
  * allocation errors.
  */
-static void rbd_finish_aio_generic(rbd_completion_t completion,
+static void rbd_finish_aio_generic_(rbd_completion_t completion,
 				   struct rbd_aio_cb *aio_cb)
 {
 	struct tcmu_device *dev = aio_cb->dev;
